@@ -1,0 +1,190 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Watermark Remover SaaS - MVP
+  Image watermark removal service with anonymous usage tracking.
+
+Globals:
+  Function:
+    Timeout: 10
+    Runtime: python3.11
+    MemorySize: 256
+    Environment:
+      Variables:
+        BUCKET_NAME: !Ref WatermarkBucket
+        TABLE_NAME: !Ref WatermarkTable
+
+Resources:
+  # ── S3 Bucket ──────────────────────────────────────────────────
+  WatermarkBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteAfter1Day
+            Status: Enabled
+            ExpirationInDays: 1
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins:
+              - "*"
+            AllowedMethods:
+              - PUT
+              - GET
+            AllowedHeaders:
+              - "*"
+            MaxAge: 3600
+
+  # ── DynamoDB Table ─────────────────────────────────────────────
+  WatermarkTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # ── SQS Queue ──────────────────────────────────────────────────
+  ProcessQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 300
+      MessageRetentionPeriod: 86400
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ProcessDLQ.Arn
+        maxReceiveCount: 3
+
+  ProcessDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  # ── API Gateway (HTTP API) ─────────────────────────────────────
+  WatermarkApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: prod
+      CorsConfiguration:
+        AllowOrigins:
+          - "*"
+        AllowMethods:
+          - GET
+          - POST
+          - OPTIONS
+        AllowHeaders:
+          - Content-Type
+          - Authorization
+        MaxAge: 3600
+
+  # ── Lambda: Presign Upload ─────────────────────────────────────
+  PresignUploadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/presign-upload/
+      Handler: app.handler
+      Environment:
+        Variables:
+          QUEUE_URL: !Ref ProcessQueue
+      Events:
+        Upload:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref WatermarkApi
+            Path: /upload
+            Method: POST
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref WatermarkBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref WatermarkTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt ProcessQueue.QueueName
+
+  # ── Lambda: Process Watermark (Container) ──────────────────────
+  ProcessWatermarkFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      PackageType: Image
+      MemorySize: 2048
+      Timeout: 300
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ProcessQueue.Arn
+            BatchSize: 1
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref WatermarkBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref WatermarkTable
+    Metadata:
+      Dockerfile: Dockerfile
+      DockerContext: functions/process-watermark/
+      DockerTag: latest
+
+  # ── Lambda: Job Status ─────────────────────────────────────────
+  JobStatusFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/job-status/
+      Handler: app.handler
+      Events:
+        GetStatus:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref WatermarkApi
+            Path: /jobs/{jobId}/status
+            Method: GET
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref WatermarkBucket
+        - DynamoDBReadPolicy:
+            TableName: !Ref WatermarkTable
+
+  # ── Lambda: Presign Download ───────────────────────────────────
+  PresignDownloadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/presign-download/
+      Handler: app.handler
+      Events:
+        Download:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref WatermarkApi
+            Path: /jobs/{jobId}/download
+            Method: POST
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref WatermarkBucket
+        - DynamoDBReadPolicy:
+            TableName: !Ref WatermarkTable
+
+Outputs:
+  ApiUrl:
+    Description: API Gateway endpoint URL
+    Value: !Sub "https://${WatermarkApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+  BucketName:
+    Description: S3 bucket for uploads and results
+    Value: !Ref WatermarkBucket
+  TableName:
+    Description: DynamoDB table name
+    Value: !Ref WatermarkTable
+  QueueUrl:
+    Description: SQS processing queue URL
+    Value: !Ref ProcessQueue
