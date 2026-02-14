@@ -1,0 +1,19 @@
+{
+  "version": "2.0",
+  "routeKey": "POST /upload",
+  "rawPath": "/upload",
+  "requestContext": {
+    "http": {
+      "method": "POST",
+      "path": "/upload",
+      "sourceIp": "203.0.113.42"
+    },
+    "requestId": "test-request-id",
+    "time": "2024-01-01T00:00:00Z"
+  },
+  "headers": {
+    "content-type": "application/json"
+  },
+  "body": "{\"filename\": \"screenshot.png\", \"contentType\": \"image/png\"}",
+  "isBase64Encoded": false
+}
