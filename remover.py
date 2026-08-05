@@ -523,12 +523,26 @@ class WatermarkRemover:
         
         return cv2.cvtColor(np.array(new_img), cv2.COLOR_RGB2BGR)
 
+    def _detect_qr_multiscale(self, img_bgr: np.ndarray):
+        detector = cv2.QRCodeDetector()
+        for scale in [1.0, 0.5, 0.25]:
+            if scale == 1.0:
+                test_img = img_bgr
+            else:
+                test_img = cv2.resize(img_bgr, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+                
+            retval, decoded_info, points, _ = detector.detectAndDecodeMulti(test_img)
+            if retval and len(points) > 0:
+                # Scale points back to original image size
+                return True, decoded_info, points / scale
+                
+        return False, [], []
+
     def _process_qr_codes_in_image(self, img_bgr: np.ndarray) -> np.ndarray:
         if not self.config.qr_links and not self.config.remove_qrs:
             return img_bgr
             
-        detector = cv2.QRCodeDetector()
-        retval, decoded_info, points, _ = detector.detectAndDecodeMulti(img_bgr)
+        retval, decoded_info, points = self._detect_qr_multiscale(img_bgr)
         
         if not retval or len(points) == 0:
             return img_bgr
@@ -571,8 +585,7 @@ class WatermarkRemover:
         if img_bgr is None:
             return 0
             
-        detector = cv2.QRCodeDetector()
-        retval, decoded_info, points, _ = detector.detectAndDecodeMulti(img_bgr)
+        retval, decoded_info, points = self._detect_qr_multiscale(img_bgr)
         
         if not retval or len(points) == 0:
             return 0
@@ -625,6 +638,10 @@ class WatermarkRemover:
             Image.fromarray(cleaned_rgb).save(buf, format='PNG')
             page.insert_image(rect, stream=buf.getvalue(), overlay=True)
             count += 1
+
+        if count > 0:
+            action = "Removed" if self.config.remove_qrs else "Replaced"
+            logger.info(f"Page {page.number}: {action} {count} QR code(s)")
                 
         return count
 
@@ -793,7 +810,12 @@ class WatermarkRemover:
             # Also process QR codes
             img_bgr_processed = self._process_qr_codes_in_image(img_bgr)
             
-            if cleaned_roi is None and np.array_equal(img_bgr, img_bgr_processed):
+            qr_changed = not np.array_equal(img_bgr, img_bgr_processed)
+            if qr_changed:
+                action = "Removed" if self.config.remove_qrs else "Replaced"
+                logger.info(f"Image {input_path}: {action} QR code(s)")
+            
+            if cleaned_roi is None and not qr_changed:
                 # No watermark and no QR codes replaced
                 return False
                 
@@ -890,6 +912,8 @@ class WatermarkRemover:
                     
                     if qr_changed or cleaned is not None:
                         if qr_changed:
+                            action = "Removed" if self.config.remove_qrs else "Replaced"
+                            logger.info(f"PPTX Image {img_name}: {action} QR code(s)")
                             img_final = cv2.merge([*cv2.split(processed_bgr), img[:, :, 3]]) if has_alpha else processed_bgr
                             ext_lower = ext.lower()
                             if ext_lower in ('.jpg', '.jpeg') and not has_alpha:
