@@ -69,6 +69,7 @@ class WatermarkConfig:
     # QR Code Replacements
     qr_links: Optional[List[str]] = None
     remove_qrs: bool = False
+    qr_padding: float = 0.04  # 4% padding around QR code to cover artifacts
 
     # Debug
     debug: bool = False
@@ -556,22 +557,25 @@ class WatermarkRemover:
             pts = pts.astype(int)
             x, y, w_bb, h_bb = cv2.boundingRect(pts)
             
-            x = max(0, x)
-            y = max(0, y)
-            w_bb = min(out.shape[1] - x, w_bb)
-            h_bb = min(out.shape[0] - y, h_bb)
+            pad_x = int(w_bb * self.config.qr_padding)
+            pad_y = int(h_bb * self.config.qr_padding)
+            
+            x_pad = max(0, x - pad_x)
+            y_pad = max(0, y - pad_y)
+            w_bb_pad = min(out.shape[1] - x_pad, w_bb + 2 * pad_x)
+            h_bb_pad = min(out.shape[0] - y_pad, h_bb + 2 * pad_y)
             
             if self.config.remove_qrs:
                 mask = np.zeros(out.shape[:2], dtype=np.uint8)
-                cv2.rectangle(mask, (x, y), (x+w_bb, y+h_bb), 255, -1)
+                cv2.rectangle(mask, (x_pad, y_pad), (x_pad+w_bb_pad, y_pad+h_bb_pad), 255, -1)
                 out = cv2.inpaint(out, mask, self.config.inpaint_radius, cv2.INPAINT_TELEA)
                 continue
                 
             link = self.config.qr_links[i]
             qr_crop = img_bgr[y:y+h_bb, x:x+w_bb]
             new_bgr = self._get_qr_replacement_image(qr_crop, link)
-            new_bgr_resized = cv2.resize(new_bgr, (w_bb, h_bb), interpolation=cv2.INTER_NEAREST)
-            out[y:y+h_bb, x:x+w_bb] = new_bgr_resized
+            new_bgr_resized = cv2.resize(new_bgr, (w_bb_pad, h_bb_pad), interpolation=cv2.INTER_NEAREST)
+            out[y_pad:y_pad+h_bb_pad, x_pad:x_pad+w_bb_pad] = new_bgr_resized
                 
         return out
 
@@ -599,19 +603,27 @@ class WatermarkRemover:
             pts = pts.astype(int)
             x, y, w_bb, h_bb = cv2.boundingRect(pts)
             
+            pad_x = int(w_bb * self.config.qr_padding)
+            pad_y = int(h_bb * self.config.qr_padding)
+            
+            x_pad = max(0, x - pad_x)
+            y_pad = max(0, y - pad_y)
+            w_bb_pad = w_bb + 2 * pad_x
+            h_bb_pad = h_bb + 2 * pad_y
+            
             rect = fitz.Rect(
-                x / self.config.pdf_dpi_scale,
-                y / self.config.pdf_dpi_scale,
-                (x + w_bb) / self.config.pdf_dpi_scale,
-                (y + h_bb) / self.config.pdf_dpi_scale
+                x_pad / self.config.pdf_dpi_scale,
+                y_pad / self.config.pdf_dpi_scale,
+                (x_pad + w_bb_pad) / self.config.pdf_dpi_scale,
+                (y_pad + h_bb_pad) / self.config.pdf_dpi_scale
             )
             
             if self.config.remove_qrs:
                 mask = np.zeros(img_bgr.shape[:2], dtype=np.uint8)
-                cv2.rectangle(mask, (x, y), (x+w_bb, y+h_bb), 255, -1)
+                cv2.rectangle(mask, (x_pad, y_pad), (x_pad+w_bb_pad, y_pad+h_bb_pad), 255, -1)
                 pad = 10
-                y0, y1 = max(0, y-pad), min(img_bgr.shape[0], y+h_bb+pad)
-                x0, x1 = max(0, x-pad), min(img_bgr.shape[1], x+w_bb+pad)
+                y0, y1 = max(0, y_pad-pad), min(img_bgr.shape[0], y_pad+h_bb_pad+pad)
+                x0, x1 = max(0, x_pad-pad), min(img_bgr.shape[1], x_pad+w_bb_pad+pad)
                 roi = img_bgr[y0:y1, x0:x1]
                 roi_mask = mask[y0:y1, x0:x1]
                 inpainted = cv2.inpaint(roi, roi_mask, self.config.inpaint_radius, cv2.INPAINT_TELEA)
@@ -970,6 +982,7 @@ def main():
     parser.add_argument("--debug", action="store_true", help="Save debug masks/images")
     parser.add_argument("--replace-qr", nargs='+', help="Replace QR codes with provided links in sequence")
     parser.add_argument("--remove-qr", action="store_true", help="Remove all QR codes")
+    parser.add_argument("--qr-padding", type=float, default=None, help="Padding ratio for QR code bounding box (default: 0.04)")
 
     args = parser.parse_args()
     config = WatermarkConfig()
@@ -994,6 +1007,8 @@ def main():
         config.qr_links = args.replace_qr
     if args.remove_qr:
         config.remove_qrs = args.remove_qr
+    if args.qr_padding is not None:
+        config.qr_padding = args.qr_padding
 
     remover = WatermarkRemover(config)
     supported = ('.pdf', '.pptx', '.png', '.jpg', '.jpeg', '.webp')
