@@ -171,29 +171,31 @@ class WatermarkRemover:
                 continue
 
             result = cv2.matchTemplate(gray_eq, tpl, cv2.TM_CCOEFF_NORMED)
-            _, max_val, _, max_loc = cv2.minMaxLoc(result)
-            if max_val > best_score:
-                x, y = max_loc
-                best_score = float(max_val)
+            min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+            
+            # Allow matching both dark-on-light (negative correlation) and light-on-dark (positive correlation)
+            match_val = max(max_val, abs(min_val))
+            match_loc = max_loc if max_val >= abs(min_val) else min_loc
+
+            if match_val > best_score:
+                x, y = match_loc
+                best_score = float(match_val)
                 best_box = (x, y, tw, th)
 
         if best_score < self.config.text_match_threshold:
             return None, best_score
         return best_box, best_score
 
-    def _extract_dark_candidates(self, roi_bgr: np.ndarray) -> np.ndarray:
+    def _extract_candidates(self, roi_bgr: np.ndarray) -> np.ndarray:
         gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
 
         # Robust background estimate
         ksize = max(15, min(41, ((min(gray.shape[:2]) // 5) | 1)))
         bg = cv2.medianBlur(gray, ksize)
-        diff_dark = cv2.subtract(bg, gray)
-
-        # Dark pixels on light background
-        dark_mask = np.where(gray < self.config.dark_text_threshold, 255, 0).astype(np.uint8)
-        _, diff_mask = cv2.threshold(diff_dark, self.config.pixel_threshold, 255, cv2.THRESH_BINARY)
-
-        mask = cv2.bitwise_and(dark_mask, diff_mask)
+        
+        # Absolute difference captures both dark-on-light and light-on-dark
+        diff = cv2.absdiff(bg, gray)
+        _, mask = cv2.threshold(diff, self.config.pixel_threshold, 255, cv2.THRESH_BINARY)
 
         # Restrict to bottom-right biased region to reduce false positives
         h, w = gray.shape[:2]
@@ -258,7 +260,7 @@ class WatermarkRemover:
         if h < 10 or w < 20:
             return None
 
-        candidate_mask = self._extract_dark_candidates(roi_bgr)
+        candidate_mask = self._extract_candidates(roi_bgr)
         comps = self._component_boxes_from_mask(candidate_mask)
         if not comps:
             return None
