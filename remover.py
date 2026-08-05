@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from tqdm import tqdm
 from PIL import Image, ImageDraw, ImageFont
 import io
+import qrcode
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -64,6 +65,10 @@ class WatermarkConfig:
     use_patch_heal: bool = True
     patch_offset_x: int = -80  # Look 80px to the left for clean background
     patch_offset_y: int = -80  # Or 80px above
+
+    # QR Code Replacements
+    qr_links: Optional[List[str]] = None
+    remove_qrs: bool = False
 
     # Debug
     debug: bool = False
@@ -491,6 +496,139 @@ class WatermarkRemover:
         return self._patch_reconstruct(img_bgr, mask)
 
     # ------------------------------------------------------------------ #
+    #  QR Code processing                                                #
+    # ------------------------------------------------------------------ #
+
+    def _get_qr_replacement_image(self, qr_crop: np.ndarray, link: str) -> np.ndarray:
+        pixels = qr_crop.reshape(-1, 3).astype(np.float32)
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
+        try:
+            _, labels, centers = cv2.kmeans(pixels, 2, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
+            centers = centers.astype(np.uint8)
+            brightness = [np.mean(c) for c in centers]
+            if brightness[0] > brightness[1]:
+                bg_color, fg_color = centers[0], centers[1]
+            else:
+                bg_color, fg_color = centers[1], centers[0]
+        except Exception:
+            bg_color, fg_color = np.array([255, 255, 255]), np.array([0, 0, 0])
+
+        new_qr = qrcode.QRCode(version=1, box_size=10, border=4)
+        new_qr.add_data(link)
+        new_qr.make(fit=True)
+        new_img = new_qr.make_image(
+            fill_color=tuple(int(c) for c in fg_color[::-1]),
+            back_color=tuple(int(c) for c in bg_color[::-1])
+        ).convert('RGB')
+        
+        return cv2.cvtColor(np.array(new_img), cv2.COLOR_RGB2BGR)
+
+    def _process_qr_codes_in_image(self, img_bgr: np.ndarray) -> np.ndarray:
+        if not self.config.qr_links and not self.config.remove_qrs:
+            return img_bgr
+            
+        detector = cv2.QRCodeDetector()
+        retval, decoded_info, points, _ = detector.detectAndDecodeMulti(img_bgr)
+        
+        if not retval or len(points) == 0:
+            return img_bgr
+
+        if self.config.qr_links and len(self.config.qr_links) != len(points):
+            logger.error(f"Found {len(points)} QR codes but {len(self.config.qr_links)} links provided. Skipping QR replacement to prevent mismatch.")
+            return img_bgr
+            
+        out = img_bgr.copy()
+        for i, pts in enumerate(points):
+            pts = pts.astype(int)
+            x, y, w_bb, h_bb = cv2.boundingRect(pts)
+            
+            x = max(0, x)
+            y = max(0, y)
+            w_bb = min(out.shape[1] - x, w_bb)
+            h_bb = min(out.shape[0] - y, h_bb)
+            
+            if self.config.remove_qrs:
+                mask = np.zeros(out.shape[:2], dtype=np.uint8)
+                cv2.rectangle(mask, (x, y), (x+w_bb, y+h_bb), 255, -1)
+                out = cv2.inpaint(out, mask, self.config.inpaint_radius, cv2.INPAINT_TELEA)
+                continue
+                
+            link = self.config.qr_links[i]
+            qr_crop = img_bgr[y:y+h_bb, x:x+w_bb]
+            new_bgr = self._get_qr_replacement_image(qr_crop, link)
+            new_bgr_resized = cv2.resize(new_bgr, (w_bb, h_bb), interpolation=cv2.INTER_NEAREST)
+            out[y:y+h_bb, x:x+w_bb] = new_bgr_resized
+                
+        return out
+
+    def _replace_qr_pdf(self, page: fitz.Page) -> int:
+        if not self.config.qr_links and not self.config.remove_qrs:
+            return 0
+            
+        mat = fitz.Matrix(self.config.pdf_dpi_scale, self.config.pdf_dpi_scale)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        img_bgr = self._pixmap_to_bgr(pix)
+        if img_bgr is None:
+            return 0
+            
+        detector = cv2.QRCodeDetector()
+        retval, decoded_info, points, _ = detector.detectAndDecodeMulti(img_bgr)
+        
+        if not retval or len(points) == 0:
+            return 0
+            
+        if self.config.qr_links and len(self.config.qr_links) != len(points):
+            logger.error(f"Page {page.number}: Found {len(points)} QR codes but {len(self.config.qr_links)} links provided. Skipping QR replacement.")
+            return 0
+            
+        count = 0
+        for i, pts in enumerate(points):
+            pts = pts.astype(int)
+            x, y, w_bb, h_bb = cv2.boundingRect(pts)
+            
+            rect = fitz.Rect(
+                x / self.config.pdf_dpi_scale,
+                y / self.config.pdf_dpi_scale,
+                (x + w_bb) / self.config.pdf_dpi_scale,
+                (y + h_bb) / self.config.pdf_dpi_scale
+            )
+            
+            if self.config.remove_qrs:
+                mask = np.zeros(img_bgr.shape[:2], dtype=np.uint8)
+                cv2.rectangle(mask, (x, y), (x+w_bb, y+h_bb), 255, -1)
+                pad = 10
+                y0, y1 = max(0, y-pad), min(img_bgr.shape[0], y+h_bb+pad)
+                x0, x1 = max(0, x-pad), min(img_bgr.shape[1], x+w_bb+pad)
+                roi = img_bgr[y0:y1, x0:x1]
+                roi_mask = mask[y0:y1, x0:x1]
+                inpainted = cv2.inpaint(roi, roi_mask, self.config.inpaint_radius, cv2.INPAINT_TELEA)
+                
+                cleaned_rgb = cv2.cvtColor(inpainted, cv2.COLOR_BGR2RGB)
+                buf = io.BytesIO()
+                Image.fromarray(cleaned_rgb).save(buf, format='PNG')
+                patch_rect = fitz.Rect(
+                    x0 / self.config.pdf_dpi_scale,
+                    y0 / self.config.pdf_dpi_scale,
+                    x1 / self.config.pdf_dpi_scale,
+                    y1 / self.config.pdf_dpi_scale
+                )
+                page.insert_image(patch_rect, stream=buf.getvalue(), overlay=True)
+                count += 1
+                continue
+                
+            link = self.config.qr_links[i]
+            qr_crop = img_bgr[y:y+h_bb, x:x+w_bb]
+            new_bgr = self._get_qr_replacement_image(qr_crop, link)
+            
+            cleaned_rgb = cv2.cvtColor(new_bgr, cv2.COLOR_BGR2RGB)
+            buf = io.BytesIO()
+            Image.fromarray(cleaned_rgb).save(buf, format='PNG')
+            page.insert_image(rect, stream=buf.getvalue(), overlay=True)
+            count += 1
+                
+        return count
+
+    # ------------------------------------------------------------------ #
     #  PDF processing                                                    #
     # ------------------------------------------------------------------ #
 
@@ -593,7 +731,9 @@ class WatermarkRemover:
                 )
                 patched_now = self._patch_pdf_rect(page, corner, precision=True)
 
-            if patched_now:
+            qr_patched = self._replace_qr_pdf(page)
+
+            if patched_now or qr_patched > 0:
                 patched += 1
             else:
                 skipped += 1
@@ -645,12 +785,19 @@ class WatermarkRemover:
 
             roi = img_bgr[y0:h, x0:w].copy()
             cleaned_roi = self._clean_roi_scaled(roi)
-            if cleaned_roi is None:
-                logger.warning(f"No watermark detected in {input_path}")
-                return False
+            if cleaned_roi is not None:
+                img_bgr[y0:h, x0:w] = cleaned_roi
+            else:
+                logger.info(f"No watermark detected in {input_path}")
 
-            img_bgr[y0:h, x0:w] = cleaned_roi
-            img_final = cv2.merge([*cv2.split(img_bgr), alpha]) if has_alpha else img_bgr
+            # Also process QR codes
+            img_bgr_processed = self._process_qr_codes_in_image(img_bgr)
+            
+            if cleaned_roi is None and np.array_equal(img_bgr, img_bgr_processed):
+                # No watermark and no QR codes replaced
+                return False
+                
+            img_final = cv2.merge([*cv2.split(img_bgr_processed), alpha]) if has_alpha else img_bgr_processed
             cv2.imwrite(output_path, img_final)
             logger.info(f"Saved cleaned image to {output_path}")
             return True
@@ -728,10 +875,36 @@ class WatermarkRemover:
 
                 ext = os.path.splitext(img_name)[1]
                 cleaned = self._clean_pptx_image_bytes(original, ext)
-                if cleaned is not None:
-                    with open(img_path, 'wb') as f:
-                        f.write(cleaned)
-                    patched += 1
+                
+                # Check for QR codes
+                img_data = cleaned if cleaned is not None else original
+                arr = np.frombuffer(img_data, dtype=np.uint8)
+                img = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
+                
+                if img is not None:
+                    has_alpha = len(img.shape) == 3 and img.shape[2] == 4
+                    img_bgr = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR) if has_alpha else img.copy()
+                    
+                    processed_bgr = self._process_qr_codes_in_image(img_bgr)
+                    qr_changed = not np.array_equal(img_bgr, processed_bgr)
+                    
+                    if qr_changed or cleaned is not None:
+                        if qr_changed:
+                            img_final = cv2.merge([*cv2.split(processed_bgr), img[:, :, 3]]) if has_alpha else processed_bgr
+                            ext_lower = ext.lower()
+                            if ext_lower in ('.jpg', '.jpeg') and not has_alpha:
+                                _, encoded = cv2.imencode('.jpg', img_final, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+                            elif ext_lower == '.webp':
+                                _, encoded = cv2.imencode('.webp', img_final, [int(cv2.IMWRITE_WEBP_QUALITY), 95])
+                            else:
+                                _, encoded = cv2.imencode('.png', img_final)
+                            final_bytes = encoded.tobytes()
+                        else:
+                            final_bytes = cleaned
+                            
+                        with open(img_path, 'wb') as f:
+                            f.write(final_bytes)
+                        patched += 1
                 pbar.set_postfix(patched=patched)
 
             with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zout:
@@ -771,6 +944,8 @@ def main():
     parser.add_argument("--radius", type=int, default=None, help="Inpaint radius")
     parser.add_argument("--no-bg-fill", action="store_true", help="Disable neighbor background reconstruction")
     parser.add_argument("--debug", action="store_true", help="Save debug masks/images")
+    parser.add_argument("--replace-qr", nargs='+', help="Replace QR codes with provided links in sequence")
+    parser.add_argument("--remove-qr", action="store_true", help="Remove all QR codes")
 
     args = parser.parse_args()
     config = WatermarkConfig()
@@ -791,6 +966,10 @@ def main():
         config.use_background_fill = False
     if args.debug:
         config.debug = True
+    if args.replace_qr:
+        config.qr_links = args.replace_qr
+    if args.remove_qr:
+        config.remove_qrs = args.remove_qr
 
     remover = WatermarkRemover(config)
     supported = ('.pdf', '.pptx', '.png', '.jpg', '.jpeg', '.webp')
