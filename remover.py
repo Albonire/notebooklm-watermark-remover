@@ -69,7 +69,7 @@ class WatermarkConfig:
     # QR Code Replacements
     qr_links: Optional[List[str]] = None
     remove_qrs: bool = False
-    qr_padding: float = 0.04  # 4% padding around QR code to cover artifacts
+    qr_padding: float = 0.00  # 0% padding by default (replaces active modules only)
 
     # Debug
     debug: bool = False
@@ -514,7 +514,7 @@ class WatermarkRemover:
         except Exception:
             bg_color, fg_color = np.array([255, 255, 255]), np.array([0, 0, 0])
 
-        new_qr = qrcode.QRCode(version=1, box_size=10, border=4)
+        new_qr = qrcode.QRCode(version=1, box_size=10, border=0)
         new_qr.add_data(link)
         new_qr.make(fit=True)
         new_img = new_qr.make_image(
@@ -982,7 +982,7 @@ def main():
     parser.add_argument("--debug", action="store_true", help="Save debug masks/images")
     parser.add_argument("--replace-qr", nargs='+', help="Replace QR codes with provided links in sequence")
     parser.add_argument("--remove-qr", action="store_true", help="Remove all QR codes")
-    parser.add_argument("--qr-padding", type=float, default=None, help="Padding ratio for QR code bounding box (default: 0.04)")
+    parser.add_argument("--qr-padding", type=float, default=None, help="Padding ratio for QR code bounding box (default: 0.00)")
 
     args = parser.parse_args()
     config = WatermarkConfig()
