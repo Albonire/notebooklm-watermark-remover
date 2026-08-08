@@ -45,14 +45,13 @@ class WatermarkConfig:
     inpaint_radius: int = 3
 
     # Component filters
-    min_watermark_components: int = 1
     min_watermark_area: int = 400
     min_component_area: int = 18
     max_component_area_ratio: float = 0.25
 
     # Text/template detection
     text_match_threshold: float = 0.45
-    dark_text_threshold: int = 210
+    text_luma_threshold: int = 210  # how far from mid-gray a pixel must be to count as "text", regardless of polarity
     roi_bottom_bias: float = 0.35
     roi_right_bias: float = 0.45
 
@@ -62,8 +61,6 @@ class WatermarkConfig:
 
     # Reconstruction
     use_patch_heal: bool = True
-    patch_offset_x: int = -80  # Look 80px to the left for clean background
-    patch_offset_y: int = -80  # Or 80px above
 
     # Debug
     debug: bool = False
@@ -78,8 +75,8 @@ class WatermarkRemover:
 
     WATERMARK_TEXT = "NotebookLM"
 
-    def __init__(self, config: WatermarkConfig = WatermarkConfig()):
-        self.config = config
+    def __init__(self, config: Optional[WatermarkConfig] = None):
+        self.config = config or WatermarkConfig()
         self._template_cache = {}
 
     # ---------- utils ---------- #
@@ -120,8 +117,12 @@ class WatermarkRemover:
         font = None
         candidates = [
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",  # Fedora/RHEL
+            "/usr/share/fonts/TTF/DejaVuSans.ttf",  # Arch
             "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/msttcore/arial.ttf",
             "/Library/Fonts/Arial.ttf",
+            "/System/Library/Fonts/Supplemental/Arial.ttf",  # modern macOS
             "C:/Windows/Fonts/arial.ttf",
         ]
         for path in candidates:
@@ -151,6 +152,23 @@ class WatermarkRemover:
         self._template_cache[key] = tpl
         return tpl
 
+    def _is_light_background(self, gray: np.ndarray) -> bool:
+        """
+        Rough polarity check for the ROI: light page background with dark text
+        (the common case), or a dark slide background with light text.
+        Sampled from the ROI border ring, which is very unlikely to contain
+        the watermark itself (it sits away from the crop edges).
+        """
+        h, w = gray.shape[:2]
+        border = max(2, min(h, w) // 20)
+        edge_pixels = np.concatenate([
+            gray[:border, :].ravel(),
+            gray[-border:, :].ravel(),
+            gray[:, :border].ravel(),
+            gray[:, -border:].ravel(),
+        ])
+        return float(np.median(edge_pixels)) >= 128
+
     def _template_match_text(self, roi_bgr: np.ndarray) -> Tuple[Optional[Tuple[int, int, int, int]], float]:
         """Template-match the watermark text in the bottom-right ROI."""
         h, w = roi_bgr.shape[:2]
@@ -158,11 +176,11 @@ class WatermarkRemover:
             return None, 0.0
 
         gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
+        light_bg = self._is_light_background(gray)
+        gray_eq = cv2.equalizeHist(gray)
+
         best_score = 0.0
         best_box = None
-
-        # Restrict to dark-on-light candidates
-        gray_eq = cv2.equalizeHist(gray)
 
         for text_h in range(max(14, h // 5), max(18, min(h - 2, h // 2 + 20)), 3):
             tpl = self._render_text_template(text_h)
@@ -172,10 +190,17 @@ class WatermarkRemover:
 
             result = cv2.matchTemplate(gray_eq, tpl, cv2.TM_CCOEFF_NORMED)
             min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
-            
-            # Allow matching both dark-on-light (negative correlation) and light-on-dark (positive correlation)
-            match_val = max(max_val, abs(min_val))
-            match_loc = max_loc if max_val >= abs(min_val) else min_loc
+
+            # The template is light text on a dark canvas. On a light-background
+            # ROI, real dark-on-light text correlates negatively against it; on a
+            # dark-background ROI, real light-on-dark text correlates positively.
+            # Pick the sign that matches this ROI's polarity instead of taking
+            # whichever is larger, which would just as happily "detect" the
+            # watermark's own inverse pattern anywhere in the page.
+            if light_bg:
+                match_val, match_loc = -min_val, min_loc
+            else:
+                match_val, match_loc = max_val, max_loc
 
             if match_val > best_score:
                 x, y = match_loc
@@ -188,14 +213,23 @@ class WatermarkRemover:
 
     def _extract_candidates(self, roi_bgr: np.ndarray) -> np.ndarray:
         gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
+        light_bg = self._is_light_background(gray)
 
         # Robust background estimate
         ksize = max(15, min(41, ((min(gray.shape[:2]) // 5) | 1)))
         bg = cv2.medianBlur(gray, ksize)
-        
-        # Absolute difference captures both dark-on-light and light-on-dark
-        diff = cv2.absdiff(bg, gray)
-        _, mask = cv2.threshold(diff, self.config.pixel_threshold, 255, cv2.THRESH_BINARY)
+
+        if light_bg:
+            # Dark text/icon on a light background
+            diff = cv2.subtract(bg, gray)
+            luma_mask = np.where(gray < self.config.text_luma_threshold, 255, 0).astype(np.uint8)
+        else:
+            # Light text/icon on a dark background
+            diff = cv2.subtract(gray, bg)
+            luma_mask = np.where(gray > (255 - self.config.text_luma_threshold), 255, 0).astype(np.uint8)
+
+        _, diff_mask = cv2.threshold(diff, self.config.pixel_threshold, 255, cv2.THRESH_BINARY)
+        mask = cv2.bitwise_and(luma_mask, diff_mask)
 
         # Restrict to bottom-right biased region to reduce false positives
         h, w = gray.shape[:2]
@@ -346,74 +380,18 @@ class WatermarkRemover:
         self._debug_save("selected_mask.png", selected_mask)
         return selected_mask
 
-    def _has_watermark(self, roi_bgr: np.ndarray) -> bool:
-        return self._build_watermark_mask(roi_bgr) is not None
-
     # ---------- reconstruction ---------- #
-
-    def _background_fill_from_neighbors(self, img_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
-        """
-        Fills masked pixels using horizontal/vertical neighbor interpolation.
-        This often preserves straight borders and dotted backgrounds better
-        than raw inpainting alone.
-        """
-        out = img_bgr.copy()
-        h, w = mask.shape[:2]
-        ys, xs = np.where(mask > 0)
-        if len(xs) == 0:
-            return out
-
-        x0, x1 = xs.min(), xs.max()
-        y0, y1 = ys.min(), ys.max()
-        expand = self.config.bg_fill_expand
-        x0 = max(0, x0 - expand)
-        y0 = max(0, y0 - expand)
-        x1 = min(w - 1, x1 + expand)
-        y1 = min(h - 1, y1 + expand)
-
-        patch = out[y0:y1 + 1, x0:x1 + 1].copy()
-        pmask = mask[y0:y1 + 1, x0:x1 + 1]
-        ph, pw = pmask.shape[:2]
-
-        # Horizontal interpolation
-        horiz = patch.copy().astype(np.float32)
-        for yy in range(ph):
-            row_mask = pmask[yy] > 0
-            if not np.any(row_mask):
-                continue
-            known = np.where(~row_mask)[0]
-            if len(known) < 2:
-                continue
-            for c in range(3):
-                vals = patch[yy, known, c].astype(np.float32)
-                interp_idx = np.where(row_mask)[0]
-                horiz[yy, interp_idx, c] = np.interp(interp_idx, known, vals)
-
-        # Vertical interpolation
-        vert = patch.copy().astype(np.float32)
-        for xx in range(pw):
-            col_mask = pmask[:, xx] > 0
-            if not np.any(col_mask):
-                continue
-            known = np.where(~col_mask)[0]
-            if len(known) < 2:
-                continue
-            for c in range(3):
-                vals = patch[known, xx, c].astype(np.float32)
-                interp_idx = np.where(col_mask)[0]
-                vert[interp_idx, xx, c] = np.interp(interp_idx, known, vals)
-
-        blend = patch.copy().astype(np.float32)
-        masked = pmask > 0
-        blend[masked] = 0.5 * horiz[masked] + 0.5 * vert[masked]
-        patch_out = np.clip(blend, 0, 255).astype(np.uint8)
-        out[y0:y1 + 1, x0:x1 + 1] = patch_out
-        return out
 
     def _patch_reconstruct(self, img_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
         """
         Heals the masked area by copying a nearby clean patch of background.
         This is much better for textures like dotted paper or grain.
+
+        Candidate source offsets scale with the size of the healed area (rather
+        than a fixed pixel distance), so this works whether the mask comes from
+        a tight PDF crop or a large upscaled image corner. Among the candidates
+        that are in-bounds and mask-free, the one whose border ring most closely
+        matches the destination's border ring is used, to avoid visible seams.
         """
         h, w = mask.shape[:2]
         ys, xs = np.where(mask > 0)
@@ -422,33 +400,49 @@ class WatermarkRemover:
 
         # Define the bounding box of the area to heal
         x0, y0, bw, bh = cv2.boundingRect(mask)
-        
-        # Expand slightly
-        pad = 2
+
+        # Expand slightly so the comparison ring below sits mostly on clean pixels
+        pad = 4
         x0_p = max(0, x0 - pad)
         y0_p = max(0, y0 - pad)
         x1_p = min(w, x0 + bw + pad)
         y1_p = min(h, y0 + bh + pad)
-        
+
         bw_p = x1_p - x0_p
         bh_p = y1_p - y0_p
 
-        # Attempt to find a clean source patch
-        # Try Left first, then Top
-        offsets = [(self.config.patch_offset_x, 0), (0, self.config.patch_offset_y), (self.config.patch_offset_x, self.config.patch_offset_y)]
-        
+        dx = max(int(bw_p * 1.2), 24)
+        dy = max(int(bh_p * 1.5), 24)
+        offsets = [(-dx, 0), (dx, 0), (0, -dy), (0, dy), (-dx, -dy), (dx, -dy)]
+
+        border = min(4, bh_p // 2, bw_p // 2)
+        ring = np.zeros((bh_p, bw_p), dtype=bool)
+        if border > 0:
+            ring[:border, :] = ring[-border:, :] = True
+            ring[:, :border] = ring[:, -border:] = True
+        dest_ring = img_bgr[y0_p:y1_p, x0_p:x1_p][ring].astype(np.int16)
+
         best_patch = None
-        for dx, dy in offsets:
-            src_x = x0_p + dx
-            src_y = y0_p + dy
-            
-            # Check if source is within bounds and doesn't overlap too much with mask
-            if src_x >= 0 and src_y >= 0 and src_x + bw_p <= w and src_y + bh_p <= h:
-                # Check if the source patch itself contains any mask pixels (it should be clean)
-                src_mask = mask[src_y:src_y + bh_p, src_x:src_x + bw_p]
-                if cv2.countNonZero(src_mask) == 0:
-                    best_patch = img_bgr[src_y:src_y + bh_p, src_x:src_x + bw_p].copy()
-                    break
+        best_diff = float('inf')
+        for ddx, ddy in offsets:
+            src_x = x0_p + ddx
+            src_y = y0_p + ddy
+
+            # Check if source is within bounds and doesn't overlap the mask
+            if src_x < 0 or src_y < 0 or src_x + bw_p > w or src_y + bh_p > h:
+                continue
+            src_mask = mask[src_y:src_y + bh_p, src_x:src_x + bw_p]
+            if cv2.countNonZero(src_mask) != 0:
+                continue
+
+            candidate = img_bgr[src_y:src_y + bh_p, src_x:src_x + bw_p]
+            if ring.any():
+                diff = float(np.abs(candidate[ring].astype(np.int16) - dest_ring).mean())
+            else:
+                diff = 0.0
+            if diff < best_diff:
+                best_diff = diff
+                best_patch = candidate.copy()
 
         out = img_bgr.copy()
         if best_patch is not None:
@@ -456,13 +450,13 @@ class WatermarkRemover:
             # to preserve as much original detail as possible.
             target_roi = out[y0_p:y1_p, x0_p:x1_p]
             mask_roi = mask[y0_p:y1_p, x0_p:x1_p]
-            
+
             # Simple alpha blending on the edges of the mask to smooth transition
             mask_float = mask_roi.astype(float) / 255.0
             mask_float = cv2.GaussianBlur(mask_float, (3, 3), 0)
-            
+
             for c in range(3):
-                target_roi[:, :, c] = (target_roi[:, :, c] * (1 - mask_float) + 
+                target_roi[:, :, c] = (target_roi[:, :, c] * (1 - mask_float) +
                                        best_patch[:, :, c] * mask_float).astype(np.uint8)
         else:
             # Fallback to inpainting if no clean patch found
@@ -470,32 +464,32 @@ class WatermarkRemover:
 
         return out
 
-    def _clean_watermark_in_roi(self, roi_bgr: np.ndarray) -> Optional[np.ndarray]:
+    def _clean_watermark_in_roi(self, roi_bgr: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray]]:
         """
-        Builds a precise mask and removes watermark using patch-based reconstruction.
+        Builds a precise mask and removes the watermark using patch-based
+        reconstruction. Returns (cleaned_roi, mask) or None if no watermark
+        was detected in this ROI.
         """
         mask = self._build_watermark_mask(roi_bgr)
         if mask is None:
             return None
 
         if self.config.use_patch_heal:
-            return self._patch_reconstruct(roi_bgr, mask)
+            cleaned = self._patch_reconstruct(roi_bgr, mask)
         else:
-            return cv2.inpaint(roi_bgr, mask, self.config.inpaint_radius, cv2.INPAINT_TELEA)
-
-    def _inpaint_region(self, img_bgr: np.ndarray) -> np.ndarray:
-        # Compatibility method for the PDF strategy 1
-        mask = self._build_watermark_mask(img_bgr)
-        if mask is None:
-            return img_bgr
-        return self._patch_reconstruct(img_bgr, mask)
+            cleaned = cv2.inpaint(roi_bgr, mask, self.config.inpaint_radius, cv2.INPAINT_TELEA)
+        return cleaned, mask
 
     # ------------------------------------------------------------------ #
     #  PDF processing                                                    #
     # ------------------------------------------------------------------ #
 
-    def _find_watermark_rect_text(self, page: fitz.Page) -> Optional[fitz.Rect]:
-        """Locate watermark via PDF text search. Returns padded Rect or None."""
+    def _find_watermark_text_rect(self, page: fitz.Page) -> Optional[fitz.Rect]:
+        """
+        Locates the watermark text via the PDF text layer. Returns a tight,
+        lightly padded Rect suitable for redaction, or None if the watermark
+        text isn't present in the text layer (e.g. a rasterized/scanned PDF).
+        """
         w, h = page.rect.width, page.rect.height
         instances = page.search_for(self.WATERMARK_TEXT)
         if not instances:
@@ -520,46 +514,82 @@ class WatermarkRemover:
         if best is None:
             return None
 
-        wm_rect = fitz.Rect(best)
-        icon_zone = fitz.Rect(best.x0 - 95, best.y0 - 18, best.x0 + 8, best.y1 + 18)
-        try:
-            for d in page.get_drawings():
-                if d.get("rect") and d["rect"].intersects(icon_zone):
-                    wm_rect = wm_rect | d["rect"]
-        except Exception:
-            pass
-        try:
-            for img_info in page.get_images(full=True):
-                for ir in page.get_image_rects(img_info[0]):
-                    if ir.intersects(icon_zone):
-                        wm_rect = wm_rect | ir
-        except Exception:
-            pass
-
-        wm_rect.x0 = min(wm_rect.x0, best.x0 - 55)
         pad = self.config.watermark_padding
         return fitz.Rect(
-            max(0, wm_rect.x0 - pad),
-            max(0, wm_rect.y0 - pad),
-            min(w, wm_rect.x1 + pad),
-            min(h, wm_rect.y1 + pad),
+            max(0, best.x0 - pad),
+            max(0, best.y0 - pad),
+            min(w, best.x1 + pad),
+            min(h, best.y1 + pad),
         )
 
-    def _patch_pdf_rect(self, page: fitz.Page, rect: fitz.Rect, precision: bool = True) -> bool:
+    def _find_watermark_icon_zone(self, text_rect: fitz.Rect, page_w: float, page_h: float) -> fitz.Rect:
+        """Region to the left of the watermark text where its icon glyph typically sits."""
+        return fitz.Rect(
+            max(0, text_rect.x0 - 95),
+            max(0, text_rect.y0 - 18),
+            min(page_w, text_rect.x0 + 8),
+            min(page_h, text_rect.y1 + 18),
+        )
+
+    def _redact_pdf_text(self, page: fitz.Page, rect: fitz.Rect) -> bool:
+        """
+        Deletes the watermark text from the PDF's text/content layer via
+        redaction. Unlike overlaying a raster image on top, this actually
+        removes the underlying text objects, so the watermark stops being
+        searchable, selectable and copiable, and the original vector
+        background is left completely untouched. Returns True if the
+        watermark text is confirmed gone afterward.
+        """
+        try:
+            page.add_redact_annot(rect, fill=None)
+            try:
+                page.apply_redactions(
+                    images=fitz.PDF_REDACT_IMAGE_NONE,
+                    graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+                    text=fitz.PDF_REDACT_TEXT_REMOVE,
+                )
+            except TypeError:
+                # Older PyMuPDF versions don't support these kwargs.
+                page.apply_redactions()
+        except Exception as e:
+            logger.debug(f"Redaction failed on page {page.number}: {e}")
+            return False
+        return not page.search_for(self.WATERMARK_TEXT)
+
+    def _patch_pdf_rect(self, page: fitz.Page, rect: fitz.Rect) -> bool:
+        """
+        Renders `rect`, detects the watermark inside it, and reinserts only
+        the tight sub-region around the detected mask -- real page content
+        elsewhere in `rect` is never re-rasterized.
+        """
         mat = fitz.Matrix(self.config.pdf_dpi_scale, self.config.pdf_dpi_scale)
         pix = page.get_pixmap(clip=rect, matrix=mat, alpha=False)
         roi_bgr = self._pixmap_to_bgr(pix)
         if roi_bgr is None:
             return False
 
-        cleaned = self._clean_watermark_in_roi(roi_bgr) if precision else self._inpaint_region(roi_bgr)
-        if cleaned is None:
+        result = self._clean_watermark_in_roi(roi_bgr)
+        if result is None:
             return False
+        cleaned, mask = result
 
-        cleaned_rgb = cv2.cvtColor(cleaned, cv2.COLOR_BGR2RGB)
+        x, y, bw, bh = cv2.boundingRect(mask)
+        px = max(2, self.config.watermark_padding)
+        x0 = max(0, x - px)
+        y0 = max(0, y - px)
+        x1 = min(roi_bgr.shape[1], x + bw + px)
+        y1 = min(roi_bgr.shape[0], y + bh + px)
+
+        scale = self.config.pdf_dpi_scale
+        sub_rect = fitz.Rect(
+            rect.x0 + x0 / scale, rect.y0 + y0 / scale,
+            rect.x0 + x1 / scale, rect.y0 + y1 / scale,
+        )
+
+        sub_rgb = cv2.cvtColor(cleaned[y0:y1, x0:x1], cv2.COLOR_BGR2RGB)
         buf = io.BytesIO()
-        Image.fromarray(cleaned_rgb).save(buf, format='PNG')
-        page.insert_image(rect, stream=buf.getvalue(), overlay=True)
+        Image.fromarray(sub_rgb).save(buf, format='PNG')
+        page.insert_image(sub_rect, stream=buf.getvalue(), overlay=True)
         return True
 
     def process_pdf(self, input_path: str, output_path: str, preview: bool = False) -> bool:
@@ -578,20 +608,33 @@ class WatermarkRemover:
                 break
 
             w, h = page.rect.width, page.rect.height
-
-            wm_rect = self._find_watermark_rect_text(page)
             patched_now = False
-            if wm_rect is not None:
-                patched_now = self._patch_pdf_rect(page, wm_rect, precision=True)
+
+            text_rect = self._find_watermark_text_rect(page)
+            if text_rect is not None:
+                icon_zone = self._find_watermark_icon_zone(text_rect, w, h)
+                if self._redact_pdf_text(page, text_rect):
+                    # Text is gone from the text/content layer. The icon glyph next
+                    # to it (if any) isn't part of the text layer, so clean it up
+                    # rasterizing just that small zone -- this is a no-op if there
+                    # turns out to be no residue there.
+                    self._patch_pdf_rect(page, icon_zone)
+                    patched_now = True
+                else:
+                    # Redaction unsupported/failed (e.g. very old PyMuPDF): fall
+                    # back to rasterizing just the watermark's own rect.
+                    patched_now = self._patch_pdf_rect(page, text_rect | icon_zone)
 
             if not patched_now:
+                # No match in the text layer at all (rasterized/scanned PDF) --
+                # fall back to scanning the bottom-right corner visually.
                 corner = fitz.Rect(
                     max(0, w - self.config.search_margin_x),
                     max(0, h - self.config.search_margin_y),
                     w,
                     h,
                 )
-                patched_now = self._patch_pdf_rect(page, corner, precision=True)
+                patched_now = self._patch_pdf_rect(page, corner)
 
             if patched_now:
                 patched += 1
@@ -613,13 +656,26 @@ class WatermarkRemover:
     # ------------------------------------------------------------------ #
 
     def _clean_roi_scaled(self, roi_bgr: np.ndarray) -> Optional[np.ndarray]:
+        """
+        Upscales the ROI for higher-quality detection/reconstruction, then
+        composites only the masked (watermark) pixels back onto the
+        original-resolution ROI -- content outside the mask is never
+        resampled through the upscale/downscale round-trip.
+        """
         scale = self.config.pdf_dpi_scale
         h, w = roi_bgr.shape[:2]
         roi_hr = cv2.resize(roi_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
-        cleaned_hr = self._clean_watermark_in_roi(roi_hr)
-        if cleaned_hr is None:
+        result = self._clean_watermark_in_roi(roi_hr)
+        if result is None:
             return None
-        return cv2.resize(cleaned_hr, (w, h), interpolation=cv2.INTER_LINEAR)
+        cleaned_hr, mask_hr = result
+
+        cleaned = cv2.resize(cleaned_hr, (w, h), interpolation=cv2.INTER_LINEAR)
+        mask = cv2.resize(mask_hr, (w, h), interpolation=cv2.INTER_NEAREST)
+
+        out = roi_bgr.copy()
+        out[mask > 0] = cleaned[mask > 0]
+        return out
 
     def process_image(self, input_path: str, output_path: str) -> bool:
         try:
@@ -769,7 +825,7 @@ def main():
     parser.add_argument("--text-threshold", type=float, default=None, help="Template match threshold, e.g. 0.48")
     parser.add_argument("--scale", type=float, default=None, help="Render/upscale factor")
     parser.add_argument("--radius", type=int, default=None, help="Inpaint radius")
-    parser.add_argument("--no-bg-fill", action="store_true", help="Disable neighbor background reconstruction")
+    parser.add_argument("--no-patch-heal", action="store_true", help="Disable clean-patch healing, use plain inpainting instead")
     parser.add_argument("--debug", action="store_true", help="Save debug masks/images")
 
     args = parser.parse_args()
@@ -787,8 +843,8 @@ def main():
         config.pdf_dpi_scale = args.scale
     if args.radius is not None:
         config.inpaint_radius = args.radius
-    if args.no_bg_fill:
-        config.use_background_fill = False
+    if args.no_patch_heal:
+        config.use_patch_heal = False
     if args.debug:
         config.debug = True
 
