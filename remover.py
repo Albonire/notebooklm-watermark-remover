@@ -783,9 +783,13 @@ class WatermarkRemover:
                 logger.warning(f"No watermark detected in {input_path}")
                 return False
 
-            cleaned_bgr, _, _ = result
+            cleaned_bgr, cleaned_alpha, _ = result
             img_bgr[y0:h, x0:w] = cleaned_bgr
-            img_final = cv2.merge([*cv2.split(img_bgr), alpha]) if has_alpha else img_bgr
+            if has_alpha and cleaned_alpha is not None:
+                alpha[y0:h, x0:w] = cleaned_alpha
+                img_final = cv2.merge([*cv2.split(img_bgr), alpha])
+            else:
+                img_final = img_bgr
 
             cv2.imwrite(output_path, img_final)
             logger.info(f"Saved cleaned image to {output_path}")
@@ -825,9 +829,13 @@ class WatermarkRemover:
         if result is None:
             return None
 
-        cleaned_bgr, _, _ = result
+        cleaned_bgr, cleaned_alpha, _ = result
         img_bgr[y0:h, x0:w] = cleaned_bgr
-        img_final = cv2.merge([*cv2.split(img_bgr), alpha]) if has_alpha else img_bgr
+        if has_alpha and cleaned_alpha is not None:
+            alpha[y0:h, x0:w] = cleaned_alpha
+            img_final = cv2.merge([*cv2.split(img_bgr), alpha])
+        else:
+            img_final = img_bgr
 
         ext = original_ext.lower()
         if ext in ('.jpg', '.jpeg') and not has_alpha:
