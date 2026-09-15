@@ -29,9 +29,10 @@ logger = logging.getLogger(__name__)
 @dataclass
 class WatermarkConfig:
     """Configuration for watermark detection and removal."""
-    # Search margins from the bottom-right corner
-    search_margin_x: int = 400
-    search_margin_y: int = 120
+    # Search margins from the bottom-right corner.
+    # When None, adaptive margins proportional to image dimensions are used (~18% width, ~8% height).
+    search_margin_x: Optional[int] = None
+    search_margin_y: Optional[int] = None
 
     # Extra padding around detected watermark bbox (pixels)
     watermark_padding: int = 3
@@ -724,7 +725,7 @@ class WatermarkRemover:
                     patched_now = self._patch_pdf_rect(page, text_rect | icon_zone)
 
             if not patched_now:
-                mx, my = self.config.search_margin_x, self.config.search_margin_y
+                mx, my = self.get_search_margins(int(w), int(h))
                 corner = fitz.Rect(
                     max(0, w - mx),
                     max(0, h - my),
@@ -770,7 +771,7 @@ class WatermarkRemover:
                 img_bgr = img.copy()
                 alpha = None
 
-            mx, my = self.config.search_margin_x, self.config.search_margin_y
+            mx, my = self.get_search_margins(w, h)
             y0 = max(0, h - my)
             x0 = max(0, w - mx)
 
@@ -814,7 +815,7 @@ class WatermarkRemover:
             img_bgr = img.copy()
             alpha = None
 
-        mx, my = self.config.search_margin_x, self.config.search_margin_y
+        mx, my = self.get_search_margins(w, h)
         y0, x0 = max(0, h - my), max(0, w - mx)
 
         roi_bgr = img_bgr[y0:h, x0:w].copy()
